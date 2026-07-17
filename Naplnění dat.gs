@@ -820,6 +820,56 @@ function processSheetData(outputSheet, FOLDER_ID, MONTH_NAME) {
     }
 }
 
+// Nastaví do buňky klikací odkaz(y) na soubor(y) - jeden formulí HYPERLINK,
+// více jako barevný symbol následovaný klikacími čísly (bez podtržení).
+// Používá se jak pro úspěšně zpracovaný řádek (✅), tak pro řádek s nalezeným,
+// ale nepoužitelným souborem (⚠️), aby šel soubor vždy rovnou otevřít.
+function setCellFileLinks(cell, urls, symbol, colorHex) {
+    if (urls.length === 1) {
+        cell.setFormula(`=HYPERLINK("${urls[0]}"; "${symbol}")`);
+        cell.setFontColor(colorHex);
+        cell.setFontStyle('normal');
+        cell.setFontLine('none');
+        cell.setBackground(null);
+    } else {
+        const richText = SpreadsheetApp.newRichTextValue();
+        let textBuilder = symbol;
+
+        urls.forEach((url, idx) => {
+            textBuilder += ` ${idx + 1}`;
+        });
+
+        richText.setText(textBuilder);
+
+        const symbolStyle = SpreadsheetApp.newTextStyle()
+            .setForegroundColor(colorHex)
+            .setUnderline(false)
+            .build();
+        richText.setTextStyle(0, symbol.length, symbolStyle);
+
+        const blackStyle = SpreadsheetApp.newTextStyle()
+            .setForegroundColor('#000000')
+            .setUnderline(false)
+            .build();
+
+        let currentPos = symbol.length + 1;
+        urls.forEach((url, idx) => {
+            const numText = (idx + 1).toString();
+            const startPos = textBuilder.indexOf(numText, currentPos);
+            const endPos = startPos + numText.length;
+
+            richText.setLinkUrl(startPos, endPos, url);
+            richText.setTextStyle(startPos, endPos, blackStyle);
+
+            currentPos = endPos + 1;
+        });
+
+        cell.setRichTextValue(richText.build());
+        cell.setBackground(null);
+    }
+    cell.setHorizontalAlignment('center');
+}
+
 function processRow(outputSheet, rowIndex, data, fileCache, config) {
     const i = rowIndex;
     const prijemni = data[i][config.prijemniColIndex];
@@ -882,7 +932,10 @@ function processRow(outputSheet, rowIndex, data, fileCache, config) {
 
     // ===== ZELENÉ ZATRŽÍTKO / ČERVENÝ KŘÍŽEK VE SLOUPCI A =====
     const cellA = outputSheet.getRange(i + 1, 1);
-    
+    // Vždy nejdřív smazat poznámku z předchozího zpracování řádku (aktualizace/reload
+    // by jinak mohly zanechat starou diagnostiku i poté, co je problém vyřešen).
+    cellA.setNote('');
+
     if (foundEntries.length === 0) {
         // Červený křížek - PŘEPÍŠE střídavé obarvení
         cellA.setValue('❌');
@@ -900,61 +953,11 @@ function processRow(outputSheet, rowIndex, data, fileCache, config) {
 
     // Vytvoření hyperlinků ve sloupci A
     const urls = foundEntries.map(entry => entry.file.getUrl());
-    
-    if (urls.length === 1) {
-        // Jeden soubor - zatržítko bez podtržení
-        cellA.setFormula(`=HYPERLINK("${urls[0]}"; "✅")`);
-        cellA.setFontColor('#00ff00');
-        cellA.setFontStyle('normal');
-        cellA.setFontLine('none');
-        cellA.setBackground(null);
-    } else {
-        // Více souborů - zatržítko zelené + čísla černá
-        const richText = SpreadsheetApp.newRichTextValue();
-        let textBuilder = '✅';
-        
-        urls.forEach((url, idx) => {
-            textBuilder += ` ${idx + 1}`;
-        });
-        
-        richText.setText(textBuilder);
-        
-        // Styl pro zatržítko - zelený bez podtržení
-        const greenStyle = SpreadsheetApp.newTextStyle()
-            .setForegroundColor('#00ff00')
-            .setUnderline(false)
-            .build();
-        richText.setTextStyle(0, 1, greenStyle);
-        
-        // Styl pro čísla - černý bez podtržení
-        const blackStyle = SpreadsheetApp.newTextStyle()
-            .setForegroundColor('#000000')
-            .setUnderline(false)
-            .build();
-        
-        // Odkazy POUZE na čísla + černý text bez podtržení
-        let currentPos = 2; // Po "✅ "
-        urls.forEach((url, idx) => {
-            const numText = (idx + 1).toString();
-            const startPos = textBuilder.indexOf(numText, currentPos);
-            const endPos = startPos + numText.length;
-            
-            // Přidat odkaz
-            richText.setLinkUrl(startPos, endPos, url);
-            
-            // Černý text bez podtržení pro tento odkaz
-            richText.setTextStyle(startPos, endPos, blackStyle);
-            
-            currentPos = endPos + 1;
-        });
-        
-        cellA.setRichTextValue(richText.build());
-        cellA.setBackground(null);
-    }
-    cellA.setHorizontalAlignment('center');
-    
-    // Komentář do sloupce B - pouze pokud je více souborů
+    setCellFileLinks(cellA, urls, '✅', '#00ff00');
+
+    // Komentář do sloupce B - vždy nejdřív smazat starý, pak zapsat jen pokud je více souborů
     const cellB = outputSheet.getRange(i + 1, 2);
+    cellB.setNote('');
     if (urls.length > 1) {
         cellB.setNote(`Zpracováno z ${urls.length} souborů:\n${foundEntries.map(e => e.originalName).join('\n')}`);
     }
@@ -963,10 +966,13 @@ function processRow(outputSheet, rowIndex, data, fileCache, config) {
     const workerDataAggregated = new Map();
     const workerDataByFile = new Map();
     let foundData = false;
+    // Sbírá lidsky čitelné důvody, proč se u konkrétního souboru/listu nepodařilo
+    // získat data - zobrazí se jako poznámka u ⚠️, pokud se nakonec nenajde nic použitelného.
+    const diagnostics = [];
 
     for (const foundEntry of foundEntries) {
         const foundFile = foundEntry.file;
-        
+
         try {
             const spreadsheet = SpreadsheetApp.open(foundFile);
             Logger.log(`  Otevírám soubor: "${foundFile.getName()}"`);
@@ -976,6 +982,7 @@ function processRow(outputSheet, rowIndex, data, fileCache, config) {
 
             if (typeof fixedSazbaForPremiums !== 'number' || fixedSazbaForPremiums <= 0) {
                 Logger.log(`  ❌ Neplatná sazba v X1 (hodnota: "${fixedSazbaForPremiums}") - přeskakuji soubor`);
+                diagnostics.push(`Soubor "${foundEntry.originalName}": neplatná sazba pro příplatky v buňce X1 prvního listu (hodnota: "${fixedSazbaForPremiums}")`);
                 continue;
             }
 
@@ -1035,15 +1042,20 @@ function processRow(outputSheet, rowIndex, data, fileCache, config) {
 
                 if (summaryRowIndex === -1) {
                     Logger.log(`    ℹ️ Sekce SOUHRN nenalezena v listu "${sheetName}" - přeskakuji`);
+                    diagnostics.push(`Soubor "${foundEntry.originalName}", list "${sheetName}": nenalezena buňka s textem "SOUHRN"`);
                     return;
                 }
 
                 if (podstrediskoColIndex === -1 || sazbaColIndex === -1 || pocetHodinColIndex === -1) {
                     Logger.log(`    ❌ Chybí povinné sloupce v listu "${sheetName}": PODSTŘEDISKO:${podstrediskoColIndex}, SAZBA:${sazbaColIndex}, POČET HODIN:${pocetHodinColIndex}`);
+                    const missingCols = [];
+                    if (podstrediskoColIndex === -1) missingCols.push('PODSTŘEDISKO');
+                    if (sazbaColIndex === -1) missingCols.push('SAZBA');
+                    if (pocetHodinColIndex === -1) missingCols.push('POČET HODIN');
+                    diagnostics.push(`Soubor "${foundEntry.originalName}", list "${sheetName}": u sekce SOUHRN chybí sloupec(e) v záhlaví: ${missingCols.join(', ')}`);
                     return;
                 }
 
-                foundData = true;
                 let dataRowsProcessed = 0;
                 let dataRowsSkipped = 0;
 
@@ -1072,6 +1084,7 @@ function processRow(outputSheet, rowIndex, data, fileCache, config) {
 
                     if (isValid) {
                         dataRowsProcessed++;
+                        foundData = true;
                         const baseCastka = baseSazba * baseHodin;
                         const nocPriplatek = nocHodin * fixedSazbaForPremiums * 0.10;
                         const vikendPriplatek = vikendHodin * fixedSazbaForPremiums * 0.10;
@@ -1103,24 +1116,32 @@ function processRow(outputSheet, rowIndex, data, fileCache, config) {
                 }
 
                 Logger.log(`    Výsledek listu "${sheetName}": ${dataRowsProcessed} zpracováno, ${dataRowsSkipped} přeskočeno`);
+
+                if (dataRowsProcessed === 0) {
+                    diagnostics.push(`Soubor "${foundEntry.originalName}", list "${sheetName}": sekce SOUHRN i sloupce nalezeny, ale žádný řádek pod nimi nemá zároveň číselnou SAZBU, nenulový POČET HODIN (příp. NOC/VÍKEND/SVÁTEK) a vyplněné PODSTŘEDISKO`);
+                }
             });
 
         } catch (e) {
             Logger.log(`  ❌ Chyba při zpracování souboru ${foundFile.getName()}: ${e.toString()}`);
+            diagnostics.push(`Soubor "${foundEntry.originalName}": chyba při čtení souboru (${e.message})`);
         }
     }
 
     if (!foundData) {
-        Logger.log(`  ❌ Žádná data nenalezena pro ${workerName} - žádná sekce SOUHRN s validními sloupci nebyla nalezena`);
-        
-        // Označit řádek jako chybný - soubor existuje, ale nemá validní data
-        cellA.setValue('⚠️');
-        cellA.setFontColor('#ff9900');
-        cellA.setHorizontalAlignment('center');
-        
+        Logger.log(`  ❌ Žádná data nenalezena pro ${workerName} - žádná sekce SOUHRN s validními daty nebyla nalezena`);
+
+        const diagnosticText = diagnostics.length > 0
+            ? diagnostics.join('\n\n')
+            : 'Nepodařilo se zjistit přesnou příčinu - zkontrolujte strukturu souboru ručně.';
+
+        // Odkaz na soubor(y) přímo ve značce ⚠️ a přesný důvod jako poznámka u buňky
+        setCellFileLinks(cellA, urls, '⚠️', '#ff9900');
+        cellA.setNote(diagnosticText);
+
         const rowRange = outputSheet.getRange(i + 1, 1, 1, outputSheet.getLastColumn());
         rowRange.setBackground('#fff2cc'); // Žlutá = soubor nalezen, ale žádná data
-        
+
         config.missingFilesNames.push(`${workerName} - soubor nalezen ale bez dat (${foundEntries.map(e => e.originalName).join(', ')})`);
         return;
     }
