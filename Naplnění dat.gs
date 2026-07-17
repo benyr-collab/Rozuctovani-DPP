@@ -129,7 +129,316 @@ function checkRowSum(sheet, row) {
   }
 }
 
-// Nová pomocná funkce - okamžitě se vrátí a spustí zpracování na pozadí
+// ===== SDÍLENÉ POMOCNÉ FUNKCE (normalizace jmen a rozpoznání typu smlouvy) =====
+// Odstraní diakritiku a převede na velká písmena, PŘITOM ZACHOVÁ DÉLKU ŘETĚZCE
+// (důležité pro fuzzy porovnávání, kde se pak podle indexů vrací zpět do originálního textu)
+function normalizeName(name) {
+    var diacriticRange = String.fromCharCode(0x0300) + '-' + String.fromCharCode(0x036f);
+    var stripDiacritics = new RegExp('[' + diacriticRange + ']', 'g');
+    return String(name).normalize('NFD').replace(stripDiacritics, '').replace(/đ/g, 'd').replace(/Đ/g, 'D').toUpperCase();
+}
+
+// Rozpozná typ pracovního poměru (DPP/DPČ) bez ohledu na diakritiku, velikost písmen
+// nebo to, jestli je v textu celá fráze nebo jen zkratka (DPP/DPC/DPČ)
+function detectContractType(contractText) {
+    const text = normalizeName(String(contractText)).trim();
+    if (!text) return null;
+
+    if (text.includes('PROVEDENI PRACE') || /(^|[^A-Z])DPP([^A-Z]|$)/.test(text)) {
+        return 'DPP';
+    }
+    if (text.includes('PRACOVNI CINNOSTI') || /(^|[^A-Z])DPC([^A-Z]|$)/.test(text)) {
+        return 'DPČ';
+    }
+    return null;
+}
+
+// Najde nejpodobnější souvislý úsek v "haystack" odpovídající "needle" (přibližné
+// vyhledávání podřetězce tolerantní k překlepům/vynechaným písmenům). Vrací editační
+// vzdálenost a pozici nalezeného úseku v haystack (indexy odpovídají originálnímu textu,
+// pokud normalizeName() zachovává délku vstupu - proto se používá výše uvedená verze).
+function fuzzyFindBestSubstring(haystack, needle) {
+    const n = haystack.length;
+    const m = needle.length;
+    if (m === 0 || n === 0) return null;
+
+    let prevDist = new Array(n + 1).fill(0);
+    let prevStart = new Array(n + 1);
+    for (let j = 0; j <= n; j++) prevStart[j] = j;
+
+    let currDist = new Array(n + 1);
+    let currStart = new Array(n + 1);
+
+    for (let i = 1; i <= m; i++) {
+        currDist[0] = i;
+        currStart[0] = 0;
+        for (let j = 1; j <= n; j++) {
+            const cost = needle[i - 1] === haystack[j - 1] ? 0 : 1;
+            const subst = prevDist[j - 1] + cost;
+            const del = prevDist[j] + 1;
+            const ins = currDist[j - 1] + 1;
+
+            let best = subst;
+            let bestStart = prevStart[j - 1];
+            if (del < best) { best = del; bestStart = prevStart[j]; }
+            if (ins < best) { best = ins; bestStart = currStart[j - 1]; }
+
+            currDist[j] = best;
+            currStart[j] = bestStart;
+        }
+        [prevDist, currDist] = [currDist, prevDist];
+        [prevStart, currStart] = [currStart, prevStart];
+    }
+
+    let bestJ = 0;
+    let bestDist = prevDist[0];
+    for (let j = 1; j <= n; j++) {
+        if (prevDist[j] < bestDist) {
+            bestDist = prevDist[j];
+            bestJ = j;
+        }
+    }
+
+    return { distance: bestDist, startIndex: prevStart[bestJ], endIndex: bestJ };
+}
+
+// Pro zadané pracovníky a soubory v adresáři najde soubory, jejichž název se PŘESNĚ
+// neshoduje se žádným pracovníkem, ale je některému z nich hodně podobný (překlep,
+// chybějící diakritika, prohozené jméno a příjmení). Vrací návrhy na přejmenování,
+// každý soubor nejvýše jednou (nejlepší shoda), seřazené podle podobnosti.
+function findFileNameSuggestions(workers, files) {
+    const exactlyMatchedFileIds = new Set();
+
+    files.forEach(file => {
+        const fileNormalized = normalizeName(file.name);
+        const hasExactMatch = workers.some(w => {
+            const n1 = w.fullNameNormalized;
+            const n2 = w.swappedNameNormalized;
+            return (n1 && fileNormalized.includes(n1)) || (n2 && fileNormalized.includes(n2));
+        });
+        if (hasExactMatch) exactlyMatchedFileIds.add(file.id);
+    });
+
+    const bestByFile = new Map();
+
+    workers.forEach(worker => {
+        if (!worker.fullNameNormalized) return;
+
+        const candidates = [worker.fullNameNormalized];
+        if (worker.swappedNameNormalized && worker.swappedNameNormalized !== worker.fullNameNormalized) {
+            candidates.push(worker.swappedNameNormalized);
+        }
+
+        files.forEach(file => {
+            if (exactlyMatchedFileIds.has(file.id)) return;
+
+            const fileNormalized = normalizeName(file.name);
+
+            let best = null;
+            candidates.forEach(candidate => {
+                const match = fuzzyFindBestSubstring(fileNormalized, candidate);
+                if (!match) return;
+                const maxAllowed = Math.max(1, Math.round(candidate.length * 0.3));
+                if (match.distance > 0 && match.distance <= maxAllowed) {
+                    if (!best || match.distance < best.distance) {
+                        best = match;
+                    }
+                }
+            });
+
+            if (!best) return;
+
+            const similarity = Math.round((1 - best.distance / worker.fullNameNormalized.length) * 100);
+            const suggestion = {
+                fileId: file.id,
+                fileName: file.name,
+                fileUrl: file.url,
+                workerFullName: worker.fullName,
+                similarity: similarity,
+                proposedName: file.name.slice(0, best.startIndex) + worker.fullName + file.name.slice(best.endIndex)
+            };
+
+            const existing = bestByFile.get(file.id);
+            if (!existing || suggestion.similarity > existing.similarity) {
+                bestByFile.set(file.id, suggestion);
+            }
+        });
+    });
+
+    return Array.from(bestByFile.values()).sort((a, b) => b.similarity - a.similarity);
+}
+
+// Vrátí ID adresáře a název měsíce podle indexu vybraného v dialogu (stejná logika,
+// jakou dřív duplikovaly processSelectedMonthVykazy i checkFileNameMatches).
+function getSelectedMonthInfo(selectedIndex) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const adresarSheet = ss.getSheetByName('Adresář');
+    if (!adresarSheet) return null;
+
+    const adresarData = adresarSheet.getDataRange().getValues();
+    const availableMonths = [];
+    for (let i = 1; i < adresarData.length; i++) {
+        const month = String(adresarData[i][0]).trim();
+        const folderId = String(adresarData[i][1]).trim();
+        if (month && folderId) {
+            availableMonths.push({ month: month, folderId: folderId });
+        }
+    }
+
+    const selectedMonth = availableMonths[parseInt(selectedIndex)];
+    if (!selectedMonth) return null;
+
+    return { FOLDER_ID: selectedMonth.folderId, MONTH_NAME: selectedMonth.month };
+}
+
+// ===== KONTROLA SHODY NÁZVŮ SOUBORŮ S JMÉNY PRACOVNÍKŮ PŘED ZPRACOVÁNÍM =====
+function checkFileNameMatches(selectedIndex) {
+    const ui = SpreadsheetApp.getUi();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+    const monthInfo = getSelectedMonthInfo(selectedIndex);
+    if (!monthInfo) {
+        SpreadsheetApp.getActiveSpreadsheet().toast('Chyba: Neplatný index měsíce', 'Chyba', 5);
+        return;
+    }
+
+    const sourceSheet = ss.getSheetByName('Zdrojová data');
+    if (!sourceSheet) {
+        SpreadsheetApp.getActiveSpreadsheet().toast('');
+        ui.alert('Chyba: List "Zdrojová data" nebyl nalezen.');
+        return;
+    }
+
+    const data = sourceSheet.getDataRange().getValues();
+    const header = data[0] || [];
+    const prijemniColIndex = header.indexOf('Příjmení') !== -1 ? header.indexOf('Příjmení') : 1;
+    const jmenoColIndex = header.indexOf('Jméno') !== -1 ? header.indexOf('Jméno') : 2;
+
+    const workers = [];
+    for (let i = 1; i < data.length; i++) {
+        const prijemni = String(data[i][prijemniColIndex] || '').trim();
+        const jmeno = String(data[i][jmenoColIndex] || '').trim();
+        if (!prijemni && !jmeno) continue;
+
+        const fullName = `${prijemni} ${jmeno}`.replace(/\s\s+/g, ' ').trim();
+        const swappedName = `${jmeno} ${prijemni}`.replace(/\s\s+/g, ' ').trim();
+
+        workers.push({
+            prijemni,
+            jmeno,
+            fullName,
+            fullNameNormalized: normalizeName(fullName),
+            swappedNameNormalized: swappedName ? normalizeName(swappedName) : ''
+        });
+    }
+
+    SpreadsheetApp.getActiveSpreadsheet().toast('Kontroluji shodu jmen se soubory...', 'Kontrola', -1);
+
+    let files;
+    try {
+        const folder = DriveApp.getFolderById(monthInfo.FOLDER_ID);
+        const filesIterator = folder.getFilesByType(MimeType.GOOGLE_SHEETS);
+        files = [];
+        while (filesIterator.hasNext()) {
+            const file = filesIterator.next();
+            files.push({ id: file.getId(), name: file.getName(), url: file.getUrl() });
+        }
+    } catch (e) {
+        SpreadsheetApp.getActiveSpreadsheet().toast('');
+        Logger.log(`❌ Chyba při čtení adresáře pro kontrolu shody jmen: ${e.toString()}`);
+        ui.alert(`Došlo k chybě při čtení adresáře: ${e.message}`);
+        return;
+    }
+
+    SpreadsheetApp.getActiveSpreadsheet().toast('');
+
+    const suggestions = findFileNameSuggestions(workers, files);
+
+    if (suggestions.length === 0) {
+        Logger.log('✅ Kontrola shody jmen: žádné nejasné shody nenalezeny, pokračuji ve zpracování.');
+        processSelectedMonthVykazy(selectedIndex);
+        return;
+    }
+
+    Logger.log(`⚠️ Kontrola shody jmen: nalezeno ${suggestions.length} možných neshod/překlepů.`);
+    showFileNameMatchDialog(selectedIndex, suggestions);
+}
+
+// Dialog s náhledem navrhovaných oprav názvů souborů - uživatel u každé položky
+// zvolí, zda se má soubor přejmenovat, a může si soubor předem otevřít a zkontrolovat.
+function showFileNameMatchDialog(selectedIndex, suggestions) {
+    let htmlContent = '<style>';
+    htmlContent += 'body { font-family: Arial, sans-serif; padding: 10px; }';
+    htmlContent += 'table { width: 100%; border-collapse: collapse; }';
+    htmlContent += 'td, th { padding: 6px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }';
+    htmlContent += '.similarity { color: #666; font-size: 12px; }';
+    htmlContent += '.buttons { margin-top: 16px; text-align: right; }';
+    htmlContent += 'button { margin-left: 8px; padding: 6px 14px; }';
+    htmlContent += '</style>';
+
+    htmlContent += '<h3>⚠️ Zkontrolujte možné neshody v názvech souborů</h3>';
+    htmlContent += '<p>Následující soubory se přesně neshodují s žádným pracovníkem, ale jsou mu podobné (možný překlep, chybějící diakritika nebo prohozené jméno a příjmení). Zaškrtněte, u kterých chcete opravit název souboru:</p>';
+
+    htmlContent += '<table>';
+    htmlContent += '<tr><th></th><th>Aktuální název souboru</th><th>Navrhovaný název</th><th>Pracovník</th></tr>';
+
+    suggestions.forEach((s, idx) => {
+        htmlContent += '<tr>';
+        htmlContent += `<td><input type="checkbox" class="match-cb" data-idx="${idx}" checked></td>`;
+        htmlContent += `<td>${s.fileName}<br><a href="${s.fileUrl}" target="_blank" rel="noopener noreferrer">Otevřít soubor →</a></td>`;
+        htmlContent += `<td>${s.proposedName}</td>`;
+        htmlContent += `<td>${s.workerFullName}<br><span class="similarity">Podobnost: ${s.similarity}%</span></td>`;
+        htmlContent += '</tr>';
+    });
+
+    htmlContent += '</table>';
+
+    htmlContent += '<div class="buttons">';
+    htmlContent += '<button onclick="google.script.host.close()">Zrušit</button>';
+    htmlContent += '<button onclick="skipAndContinue()">Přeskočit a pokračovat</button>';
+    htmlContent += '<button onclick="applyAndContinue()">Přejmenovat vybrané a pokračovat</button>';
+    htmlContent += '</div>';
+
+    htmlContent += '<script>';
+    htmlContent += `var selectedIndex = ${JSON.stringify(String(selectedIndex))};`;
+    htmlContent += `var suggestions = ${JSON.stringify(suggestions)};`;
+    htmlContent += 'function skipAndContinue() {';
+    htmlContent += '  google.script.run.withSuccessHandler(google.script.host.close).continueProcessingAfterCheck(selectedIndex, []);';
+    htmlContent += '}';
+    htmlContent += 'function applyAndContinue() {';
+    htmlContent += '  var checked = Array.prototype.slice.call(document.querySelectorAll(".match-cb:checked")).map(function(cb) {';
+    htmlContent += '    return suggestions[parseInt(cb.getAttribute("data-idx"), 10)];';
+    htmlContent += '  });';
+    htmlContent += '  google.script.run.withSuccessHandler(google.script.host.close).continueProcessingAfterCheck(selectedIndex, checked);';
+    htmlContent += '}';
+    htmlContent += '</script>';
+
+    const html = HtmlService.createHtmlOutput(htmlContent)
+        .setWidth(700)
+        .setHeight(500);
+
+    SpreadsheetApp.getUi().showModalDialog(html, 'Kontrola názvů souborů');
+}
+
+// Provede potvrzená přejmenování souborů na Google Disku a poté pokračuje ve
+// standardním zpracování měsíce.
+function continueProcessingAfterCheck(selectedIndex, confirmedSuggestions) {
+    if (confirmedSuggestions && confirmedSuggestions.length > 0) {
+        confirmedSuggestions.forEach(s => {
+            try {
+                const file = DriveApp.getFileById(s.fileId);
+                file.setName(s.proposedName);
+                Logger.log(`✅ Přejmenován soubor "${s.fileName}" → "${s.proposedName}"`);
+            } catch (e) {
+                Logger.log(`❌ Nepodařilo se přejmenovat soubor "${s.fileName}": ${e.toString()}`);
+            }
+        });
+    }
+
+    processSelectedMonthVykazy(selectedIndex);
+}
+
+// Nová pomocná funkce - okamžitě se vrátí a spustí kontrolu shody jmen na pozadí
 function startProcessingVykazy(selectedIndex) {
     Logger.log(`========== START PROCESSING VYKAZY ==========`);
     Logger.log(`Typ parametru: ${typeof selectedIndex}`);
@@ -137,19 +446,18 @@ function startProcessingVykazy(selectedIndex) {
     Logger.log(`Je null? ${selectedIndex === null}`);
     Logger.log(`Je undefined? ${selectedIndex === undefined}`);
     Logger.log(`======================================`);
-    
+
     if (selectedIndex === null || selectedIndex === undefined) {
         Logger.log('❌ CHYBA: selectedIndex je null nebo undefined');
         SpreadsheetApp.getActiveSpreadsheet().toast('Chyba: Nebyl vybrán žádný měsíc', 'Chyba', 5);
         return;
     }
-    
-    // Spustit zpracování asynchronně
-    SpreadsheetApp.getActiveSpreadsheet().toast('Spouštím zpracování...', 'Připravuji', 3);
-    Logger.log('✅ Spouštím processSelectedMonthVykazy...');
-    
-    // Pak spustit samotné zpracování
-    processSelectedMonthVykazy(selectedIndex);
+
+    // Nejdřív zkontrolovat shodu jmen souborů s pracovníky, pak teprve zpracovat
+    SpreadsheetApp.getActiveSpreadsheet().toast('Kontroluji názvy souborů...', 'Připravuji', 3);
+    Logger.log('✅ Spouštím checkFileNameMatches...');
+
+    checkFileNameMatches(selectedIndex);
 }
 
 function processDataForWorkers() {
@@ -239,41 +547,22 @@ function processSelectedMonthVykazy(selectedIndex) {
     Logger.log(`\n========== PROCESS SELECTED MONTH VYKAZY ==========`);
     Logger.log(`Parametr selectedIndex: ${selectedIndex}`);
     Logger.log(`Typ: ${typeof selectedIndex}`);
-    
+
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const ui = SpreadsheetApp.getUi();
-    const adresarSheet = ss.getSheetByName('Adresář');
-    
-    Logger.log(`Adresář sheet: ${adresarSheet ? 'OK' : 'NOT FOUND'}`);
-    
-    const adresarData = adresarSheet.getDataRange().getValues();
-    Logger.log(`Počet řádků v adresáři: ${adresarData.length}`);
-    
-    const availableMonths = [];
-    for (let i = 1; i < adresarData.length; i++) {
-        const month = String(adresarData[i][0]).trim();
-        const folderId = String(adresarData[i][1]).trim();
-        if (month && folderId) {
-            availableMonths.push({ month: month, folderId: folderId });
-            Logger.log(`  availableMonths[${availableMonths.length - 1}]: ${month}`);
-        }
-    }
-    
-    Logger.log(`Celkem dostupných měsíců: ${availableMonths.length}`);
-    Logger.log(`Parsovaný index: ${parseInt(selectedIndex)}`);
-    
-    const selectedMonth = availableMonths[parseInt(selectedIndex)];
-    Logger.log(`Vybraný měsíc: ${selectedMonth ? JSON.stringify(selectedMonth) : 'NULL'}`);
-    
-    if (!selectedMonth) {
+
+    const monthInfo = getSelectedMonthInfo(selectedIndex);
+    Logger.log(`Vybraný měsíc: ${monthInfo ? JSON.stringify(monthInfo) : 'NULL'}`);
+
+    if (!monthInfo) {
         Logger.log('❌ CHYBA: selectedMonth je null');
         SpreadsheetApp.getActiveSpreadsheet().toast('Chyba: Neplatný index měsíce', 'Chyba', 5);
         return;
     }
-    
-    const FOLDER_ID = selectedMonth.folderId;
-    let MONTH_NAME = selectedMonth.month;
-    
+
+    const FOLDER_ID = monthInfo.FOLDER_ID;
+    let MONTH_NAME = monthInfo.MONTH_NAME;
+
     Logger.log(`\n========== VYBRANÝ MĚSÍC ==========`);
     Logger.log(`Měsíc: ${MONTH_NAME}`);
     Logger.log(`ID adresáře: "${FOLDER_ID}"`);
@@ -383,10 +672,6 @@ function processSheetData(outputSheet, FOLDER_ID, MONTH_NAME) {
     const TEXT_FORMAT = '@';
     const podstrediskoRegex = /^\d{2}-\d{2}-\d{2}(\/\d+)?$/;
 
-    const normalizeName = (name) => {
-        return name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D').toUpperCase();
-    };
-
     const roundHours = (value) => {
         return Math.round(value * 100) / 100;
     };
@@ -399,16 +684,6 @@ function processSheetData(outputSheet, FOLDER_ID, MONTH_NAME) {
             return `${day}-${month}-${year}`;
         }
         return String(value);
-    };
-
-    const detectContractType = (contractText) => {
-        const text = String(contractText).trim().toLowerCase();
-        if (text.includes('dohoda o provedení práce') || text.includes('dpp')) {
-            return 'DPP';
-        } else if (text.includes('dohoda o pracovní činnosti') || text.includes('dpč')) {
-            return 'DPČ';
-        }
-        return null;
     };
 
     try {
@@ -1043,10 +1318,6 @@ function reloadCurrentRow() {
     const filesIterator = folder.getFilesByType(MimeType.GOOGLE_SHEETS);
     const fileCache = [];
     
-    const normalizeName = (name) => {
-        return name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D').toUpperCase();
-    };
-    
     while (filesIterator.hasNext()) {
         const file = filesIterator.next();
         fileCache.push({
@@ -1080,12 +1351,7 @@ function reloadCurrentRow() {
             }
             return String(value);
         },
-        detectContractType: (contractText) => {
-            const text = String(contractText).trim().toLowerCase();
-            if (text.includes('dohoda o provedení práce') || text.includes('dpp')) return 'DPP';
-            if (text.includes('dohoda o pracovní činnosti') || text.includes('dpč')) return 'DPČ';
-            return null;
-        },
+        detectContractType: detectContractType,
         missingFilesNames: []
     };
     

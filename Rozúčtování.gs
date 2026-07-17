@@ -269,18 +269,17 @@ function summarizeByWorkCenter(selectedMonth, shouldOverwrite) {
     const summaryMap = new Map();
     const employeeDetails = [];
 
-    const druhPpMap = {
-      'dohoda o provedení práce': 'DPP',
-      'dohoda o pracovní činnosti': 'DPČ'
-    };
-
     for (let i = 1; i < data.length; i++) {
       const row = data[i];
       const prijemni = String(row[prijemniIndex]).trim();
       const jmeno = String(row[jmenoIndex]).trim();
-      let druhPp = String(row[druhPpIndex]).trim().toLowerCase();
+      const druhPpRaw = String(row[druhPpIndex]).trim();
 
-      druhPp = druhPpMap[druhPp] || druhPp;
+      // detectContractType() je sdílená funkce (Naplnění dat.gs) - rozpozná DPP/DPČ
+      // bez ohledu na diakritiku, velikost písmen nebo formu Unicode normalizace,
+      // takže se nespoléhá na přesnou shodu celé fráze jako dřívější druhPpMap.
+      const detectedDruhPp = detectContractType(druhPpRaw);
+      let druhPp = detectedDruhPp || druhPpRaw.toLowerCase();
 
       const fullName = `${prijemni} ${jmeno}`.trim();
 
