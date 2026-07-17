@@ -421,18 +421,39 @@ function showFileNameMatchDialog(selectedIndex, suggestions) {
 }
 
 // Provede potvrzená přejmenování souborů na Google Disku a poté pokračuje ve
-// standardním zpracování měsíce.
+// standardním zpracování měsíce. Neúspěšná přejmenování se NEPŘEHLÍŽÍ potichu -
+// uživatel je před pokračováním zpracování upozorněn, protože soubor pod starým
+// názvem nemusí být při zpracování nalezen.
 function continueProcessingAfterCheck(selectedIndex, confirmedSuggestions) {
+    const failedRenames = [];
+
     if (confirmedSuggestions && confirmedSuggestions.length > 0) {
         confirmedSuggestions.forEach(s => {
             try {
                 const file = DriveApp.getFileById(s.fileId);
                 file.setName(s.proposedName);
-                Logger.log(`✅ Přejmenován soubor "${s.fileName}" → "${s.proposedName}"`);
+
+                const actualName = file.getName();
+                if (actualName !== s.proposedName) {
+                    Logger.log(`⚠️ Přejmenování souboru "${s.fileName}" se neprojevilo (aktuální název: "${actualName}")`);
+                    failedRenames.push(`${s.fileName} → ${s.proposedName} (výsledný název: "${actualName}")`);
+                } else {
+                    Logger.log(`✅ Přejmenován soubor "${s.fileName}" → "${s.proposedName}"`);
+                }
             } catch (e) {
                 Logger.log(`❌ Nepodařilo se přejmenovat soubor "${s.fileName}": ${e.toString()}`);
+                failedRenames.push(`${s.fileName} (chyba: ${e.message})`);
             }
         });
+    }
+
+    if (failedRenames.length > 0) {
+        SpreadsheetApp.getUi().alert(
+            'Některé soubory se nepodařilo přejmenovat:\n\n' +
+            failedRenames.join('\n') +
+            '\n\nNejčastější příčinou je, že k souboru máte jen oprávnění k prohlížení/komentování, ne k úpravám.\n\n' +
+            'Zpracování bude pokračovat s původními (nepřejmenovanými) názvy souborů.'
+        );
     }
 
     processSelectedMonthVykazy(selectedIndex);
